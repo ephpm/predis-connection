@@ -1,0 +1,36 @@
+{
+    "name": "ephpm/predis-connection",
+    "description": "Predis Connection backend that routes Redis-shaped calls to ePHPm's in-process KV store via the ephpm_kv_* SAPI functions — zero socket round-trips.",
+    "type": "library",
+    "license": "MIT",
+    "keywords": ["predis", "redis", "ephpm", "kv", "cache", "sapi"],
+    "homepage": "https://ephpm.dev",
+    "support": {
+        "issues": "https://github.com/ephpm/predis-connection/issues",
+        "source": "https://github.com/ephpm/predis-connection"
+    },
+    "require": {
+        "php": "^8.2",
+        "predis/predis": "^2.2"
+    },
+    "require-dev": {
+        "phpunit/phpunit": "^10.5 || ^11.0"
+    },
+    "autoload": {
+        "psr-4": {
+            "Ephpm\\Predis\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Ephpm\\Predis\\Tests\\": "tests/"
+        }
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "minimum-stability": "stable"
+}
