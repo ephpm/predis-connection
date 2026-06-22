@@ -72,4 +72,13 @@ interface KvOpsInterface
      * -2 if the key does not exist, otherwise the ms remaining.
      */
     public function pttl(string $key): int;
+
+    /**
+     * Remove every key from the effective store (per-site if the request
+     * is bound to a site store, otherwise the global store). Backs the
+     * Redis `FLUSHDB` / `FLUSHALL` commands.
+     *
+     * @return bool true on success, false if no store is available
+     */
+    public function flush(): bool;
 }

@@ -63,4 +63,15 @@ final class SapiKvOps implements KvOpsInterface
     {
         return (int) \ephpm_kv_pttl($key);
     }
+
+    public function flush(): bool
+    {
+        // ephpm_kv_flush_all() was added after the original SAPI surface;
+        // guard so this connection still loads on older ePHPm runtimes
+        // (flush is simply unavailable there rather than a fatal).
+        if (!\function_exists('ephpm_kv_flush_all')) {
+            return false;
+        }
+        return (bool) \ephpm_kv_flush_all();
+    }
 }
