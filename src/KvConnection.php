@@ -61,6 +61,8 @@ final class KvConnection implements NodeConnectionInterface
         'SELECT',
         'AUTH',
         'QUIT',
+        'FLUSHDB',
+        'FLUSHALL',
     ];
 
     private ParametersInterface $parameters;
@@ -179,6 +181,9 @@ final class KvConnection implements NodeConnectionInterface
             'PING'            => $args[0] ?? 'PONG',
             'ECHO'            => (string) $args[0],
             'SELECT', 'AUTH', 'QUIT' => 'OK',
+            // ephpm KV is a single keyspace, so FLUSHDB and FLUSHALL are
+            // equivalent — both clear the whole effective store.
+            'FLUSHDB', 'FLUSHALL' => $this->ops->flush() ? 'OK' : null,
             default           => throw new CommandNotSupportedException($id),
         };
     }

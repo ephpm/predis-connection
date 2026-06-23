@@ -10,6 +10,7 @@ use Ephpm\Predis\KvConnection;
 use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use Predis\Client;
+use Predis\Command\RawCommand;
 
 #[CoversClass(KvConnection::class)]
 #[CoversClass(CommandNotSupportedException::class)]
@@ -88,7 +89,11 @@ final class KvConnectionTest extends TestCase
     {
         $client = $this->client();
         $client->set('a', '1');
-        $unlink = $client->createCommand('UNLINK', ['a']);
+        // Use RawCommand rather than createCommand('UNLINK'): older Predis
+        // factories don't register an UNLINK command class, which would throw
+        // before the request ever reaches our connection. RawCommand bypasses
+        // the factory and exercises KvConnection's UNLINK->DEL aliasing directly.
+        $unlink = new RawCommand('UNLINK', ['a']);
         self::assertSame(1, $client->executeCommand($unlink));
         self::assertNull($client->get('a'));
     }
@@ -229,6 +234,33 @@ final class KvConnectionTest extends TestCase
             $pipe->get('counter');
         });
         self::assertSame(['OK', 'OK', 1, 2, '1', '2', '2'], $responses);
+    }
+
+    // ── flush ────────────────────────────────────────────────────────────────
+
+    public function test_flushdb_clears_all_keys(): void
+    {
+        $client = $this->client();
+        $client->set('a', '1');
+        $client->set('b', '2');
+        self::assertSame(2, $client->exists('a', 'b'));
+
+        self::assertSame('OK', $client->flushdb());
+
+        self::assertSame(0, $client->exists('a', 'b'));
+        self::assertNull($client->get('a'));
+
+        // Usable after flush.
+        $client->set('c', '3');
+        self::assertSame('3', $client->get('c'));
+    }
+
+    public function test_flushall_clears_all_keys(): void
+    {
+        $client = $this->client();
+        $client->set('a', '1');
+        self::assertSame('OK', $client->flushall());
+        self::assertNull($client->get('a'));
     }
 
     // ── connection lifecycle ─────────────────────────────────────────────────

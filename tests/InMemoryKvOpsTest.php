@@ -108,4 +108,22 @@ final class InMemoryKvOpsTest extends TestCase
         // Original TTL unchanged.
         self::assertGreaterThan(0, $ops->pttl('k'));
     }
+
+    public function test_flush_removes_all_keys_and_is_reusable(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->set('a', '1');
+        $ops->set('b', '2', 60);
+        self::assertTrue($ops->exists('a'));
+        self::assertTrue($ops->exists('b'));
+
+        self::assertTrue($ops->flush());
+        self::assertFalse($ops->exists('a'));
+        self::assertFalse($ops->exists('b'));
+        self::assertNull($ops->get('a'));
+
+        // Store is still usable after a flush.
+        $ops->set('c', '3');
+        self::assertSame('3', $ops->get('c'));
+    }
 }

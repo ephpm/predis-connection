@@ -338,6 +338,7 @@ If this round-trips successfully you've confirmed:
 | `TYPE`                                           | Returns `string` if the key exists, `none` if not.                      |
 | `PING`, `ECHO`                                   | Connection liveness, payload echo.                                      |
 | `SELECT`, `AUTH`, `QUIT`                         | Tolerated as no-ops so framework handshakes don't break.                |
+| `FLUSHDB`, `FLUSHALL`                            | Clear the entire effective store. ephpm's KV is a single keyspace, so both are equivalent. Needs an ePHPm runtime with `ephpm_kv_flush_all`; older runtimes make this a no-op returning `null`. |
 
 Everything else — lists, sets, hashes, sorted sets, streams, scripting,
 pub/sub, `MULTI`/`EXEC` — raises `Ephpm\Predis\CommandNotSupportedException`
