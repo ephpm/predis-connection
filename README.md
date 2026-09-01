@@ -48,7 +48,10 @@ written in Rust.
 
 - **PHP 8.2+**
 - **`predis/predis` ^2.2** (Composer pulls this in automatically)
-- **The ePHPm runtime** — the global `ephpm_kv_*` SAPI functions are
+- **The ePHPm runtime** — any tagged release works for the core
+  commands (the `ephpm_kv_*` SAPI functions have shipped since ePHPm
+  v0.1.0; `FLUSHDB`/`FLUSHALL` need `ephpm_kv_flush_all()`, added in
+  v0.1.2; current release: v0.8.6). The functions are
   registered by ePHPm's embedded PHP. If you're running your code under
   PHP-FPM, Apache mod_php, or the stock PHP CLI, those functions don't
   exist and `SapiKvOps::__construct()` throws on instantiation. For
@@ -68,8 +71,14 @@ will refuse to construct.
 
 ## Install
 
+ePHPm packages are distributed via their GitHub repositories, not
+Packagist. Add this repo as a Composer `vcs` repository, then require
+the package (`ephpm/predis-connection` is tagged `v0.1.0`, so `^0.1`
+resolves):
+
 ```bash
-composer require ephpm/predis-connection
+composer config repositories.ephpm/predis-connection vcs https://github.com/ephpm/predis-connection
+composer require ephpm/predis-connection:^0.1
 ```
 
 That's it. Composer pulls in `predis/predis` if you don't already have it.
@@ -79,7 +88,8 @@ If you're starting a brand-new project from scratch:
 ```bash
 mkdir my-app && cd my-app
 composer init --no-interaction --name=acme/my-app --require=php:^8.2
-composer require ephpm/predis-connection
+composer config repositories.ephpm/predis-connection vcs https://github.com/ephpm/predis-connection
+composer require ephpm/predis-connection:^0.1
 ```
 
 ---
@@ -104,12 +114,12 @@ my-app/
 ```json
 {
     "name": "acme/my-app",
+    "repositories": [
+        { "type": "vcs", "url": "https://github.com/ephpm/predis-connection" }
+    ],
     "require": {
         "php": "^8.2",
         "ephpm/predis-connection": "^0.1"
-    },
-    "autoload": {
-        "files": ["vendor/autoload.php"]
     }
 }
 ```
@@ -338,7 +348,7 @@ If this round-trips successfully you've confirmed:
 | `TYPE`                                           | Returns `string` if the key exists, `none` if not.                      |
 | `PING`, `ECHO`                                   | Connection liveness, payload echo.                                      |
 | `SELECT`, `AUTH`, `QUIT`                         | Tolerated as no-ops so framework handshakes don't break.                |
-| `FLUSHDB`, `FLUSHALL`                            | Clear the entire effective store. ephpm's KV is a single keyspace, so both are equivalent. Needs an ePHPm runtime with `ephpm_kv_flush_all`; older runtimes make this a no-op returning `null`. |
+| `FLUSHDB`, `FLUSHALL`                            | Clear the entire effective store. ephpm's KV is a single keyspace, so both are equivalent. Needs ePHPm v0.1.2+ (`ephpm_kv_flush_all`); on v0.1.0/v0.1.1 this is a no-op returning `null`. |
 
 Everything else — lists, sets, hashes, sorted sets, streams, scripting,
 pub/sub, `MULTI`/`EXEC` — raises `Ephpm\Predis\CommandNotSupportedException`
@@ -354,7 +364,7 @@ beyond that, point Predis at a real Redis for those calls.
 | -------------------- | --------------- |
 | `EX seconds`         | supported       |
 | `PX milliseconds`    | supported (rounded up to seconds) |
-| `NX`, `XX`           | unsupported (no atomic CAS in the SAPI surface) |
+| `NX`, `XX`           | unsupported (`SET NX`/`XX` is not yet wired to the SAPI's `ephpm_kv_setnx()`) |
 | `GET`                | unsupported     |
 | `KEEPTTL`            | unsupported     |
 | `EXAT`, `PXAT`       | unsupported     |
