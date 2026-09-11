@@ -24,7 +24,10 @@
     "autoload-dev": {
         "psr-4": {
             "Ephpm\\Predis\\Tests\\": "tests/"
-        }
+        },
+        "files": [
+            "tests/sapi_kv_stubs.php"
+        ]
     },
     "config": {
         "sort-packages": true

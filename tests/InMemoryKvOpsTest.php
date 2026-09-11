@@ -59,6 +59,46 @@ final class InMemoryKvOpsTest extends TestCase
         $ops->incrBy('label', 1);
     }
 
+    public function test_setnx_inserts_only_when_absent(): void
+    {
+        $ops = new InMemoryKvOps();
+        self::assertTrue($ops->setnx('lock', 'first'));
+        self::assertFalse($ops->setnx('lock', 'second'));
+        // Existing value is preserved — SETNX never overwrites.
+        self::assertSame('first', $ops->get('lock'));
+    }
+
+    public function test_setnx_applies_ttl_on_insert(): void
+    {
+        $ops = new InMemoryKvOps();
+        self::assertTrue($ops->setnx('lock', 'v', 30));
+        $pttl = $ops->pttl('lock');
+        self::assertGreaterThan(0, $pttl);
+        self::assertLessThanOrEqual(30_000, $pttl);
+    }
+
+    public function test_set_returns_false_under_simulated_oom(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->simulateOom(true);
+        self::assertFalse($ops->set('k', 'v'));
+        // Nothing was stored.
+        self::assertNull($ops->get('k'));
+
+        // Clearing OOM restores normal writes.
+        $ops->simulateOom(false);
+        self::assertTrue($ops->set('k', 'v'));
+        self::assertSame('v', $ops->get('k'));
+    }
+
+    public function test_setnx_returns_false_under_simulated_oom(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->simulateOom(true);
+        self::assertFalse($ops->setnx('k', 'v'));
+        self::assertNull($ops->get('k'));
+    }
+
     public function test_set_with_ttl_then_pttl_within_window(): void
     {
         $ops = new InMemoryKvOps();
