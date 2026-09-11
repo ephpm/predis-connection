@@ -37,6 +37,7 @@ written in Rust.
 - [Verifying the connection is live](#verifying-the-connection-is-live)
 - [Supported commands](#supported-commands)
 - [SET modifier matrix](#set-modifier-matrix)
+- [Predis 3 compatibility](#predis-3-compatibility)
 - [Testing without ePHPm](#testing-without-ephpm)
 - [Troubleshooting](#troubleshooting)
 - [How it works](#how-it-works)
@@ -47,11 +48,13 @@ written in Rust.
 ## Requirements
 
 - **PHP 8.2+**
-- **`predis/predis` ^2.2** (Composer pulls this in automatically)
+- **`predis/predis` ^2.2** (Composer pulls this in automatically). Predis 3
+  is **not** supported yet — see [Predis 3 compatibility](#predis-3-compatibility).
 - **The ePHPm runtime** — any tagged release works for the core
   commands (the `ephpm_kv_*` SAPI functions have shipped since ePHPm
   v0.1.0; `FLUSHDB`/`FLUSHALL` need `ephpm_kv_flush_all()`, added in
-  v0.1.2; current release: v0.8.6). The functions are
+  v0.1.2; `SETNX` / `SET … NX` need `ephpm_kv_setnx()`; current release:
+  v0.10.2). The functions are
   registered by ePHPm's embedded PHP. If you're running your code under
   PHP-FPM, Apache mod_php, or the stock PHP CLI, those functions don't
   exist and `SapiKvOps::__construct()` throws on instantiation. For
@@ -210,7 +213,8 @@ register this connection class as a custom scheme.
 
 ### What now works through ePHPm's KV store
 
-Anything in Laravel that goes through Predis. With the config above:
+The string/counter/TTL parts of Laravel that go through Predis. With the
+config above:
 
 | Laravel feature                         | Now backed by ePHPm KV |
 |-----------------------------------------|------------------------|
@@ -218,15 +222,21 @@ Anything in Laravel that goes through Predis. With the config above:
 | `Redis::get(...)`, `Redis::set(...)`    | yes                    |
 | `Cache::remember('key', 60, fn …)`      | yes                    |
 | Session driver = `redis`                | yes                    |
-| Queue throttling / rate limiters        | yes                    |
-| Broadcast presence channels (counters)  | yes                    |
+| `Cache::add(...)` (SET NX / SETNX lock) | yes                    |
+| `Cache::lock(...)` atomic locks         | yes (uses SET NX)      |
 
-What doesn't (yet): queue *workers* on the `redis` connection (uses
-`BLPOP` from the `lists` family), broadcasting via Redis pub/sub
-(`SUBSCRIBE`/`PUBLISH`), and any explicit list/hash/set ops you've
-written. Those will throw `CommandNotSupportedException` and you'll need
-to either keep a real Redis available for those workloads or move them
-to a different transport.
+What does **not** work — these throw `CommandNotSupportedException`, so
+keep them on a real Redis (or a different transport):
+
+- **Queue workers** on the `redis` connection — the `redis` queue driver
+  uses blocking list ops (`BLPOP`) from the `lists` family.
+- **Broadcasting via Redis pub/sub** (`SUBSCRIBE` / `PUBLISH`), including
+  presence-channel fan-out.
+- **`Redis::throttle(...)` / `funnel(...)` rate limiters** and anything else
+  that ships a Lua script — they run via `EVAL`, which this connection does
+  not implement. (Laravel's *cache-based* limiter — `RateLimiter` / the
+  `throttle` middleware — is fine: it only uses counter ops.)
+- Any explicit list / hash / set / sorted-set / stream ops you've written.
 
 ### Sanity check from artisan
 
@@ -341,7 +351,8 @@ If this round-trips successfully you've confirmed:
 
 | Command(s)                                       | Behavior                                                                |
 | ------------------------------------------------ | ----------------------------------------------------------------------- |
-| `GET`, `SET`, `SETEX`, `PSETEX`                  | Strings with optional `EX`/`PX` TTL. `PX`/`PSETEX` round up to seconds. |
+| `GET`, `SET`, `SETEX`, `PSETEX`                  | Strings with optional `EX`/`PX` TTL. `PX`/`PSETEX` round up to seconds. `SET … NX` supported; `XX`/`GET`/`KEEPTTL`/`EXAT`/`PXAT` are not. |
+| `SETNX`, `SET … NX`                              | Atomic insert-if-absent via `ephpm_kv_setnx` (Redis lock recipes). `SETNX` returns `1`/`0`; `SET … NX` returns `OK`/nil. See the [OOM note](#oom-and-setnx) below. |
 | `DEL`, `UNLINK`, `EXISTS`                        | Multi-key, return count.                                                |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY`               | Atomic counter ops via the SAPI's `ephpm_kv_incr_by`.                   |
 | `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`               | TTL management. `PEXPIRE` rounds up.                                    |
@@ -350,11 +361,14 @@ If this round-trips successfully you've confirmed:
 | `SELECT`, `AUTH`, `QUIT`                         | Tolerated as no-ops so framework handshakes don't break.                |
 | `FLUSHDB`, `FLUSHALL`                            | Clear the entire effective store. ephpm's KV is a single keyspace, so both are equivalent. Needs ePHPm v0.1.2+ (`ephpm_kv_flush_all`); on v0.1.0/v0.1.1 this is a no-op returning `null`. |
 
-Everything else — lists, sets, hashes, sorted sets, streams, scripting,
-pub/sub, `MULTI`/`EXEC` — raises `Ephpm\Predis\CommandNotSupportedException`
-with a clear "ephpm KV does not implement \<CMD\>" message. ePHPm's KV
-store is intentionally a string + counter store; if you need anything
-beyond that, point Predis at a real Redis for those calls.
+Everything else — lists, sets, hashes, sorted sets, streams, scripting
+(`EVAL`), pub/sub (`SUBSCRIBE`/`PUBLISH`), `MULTI`/`EXEC` — raises
+`Ephpm\Predis\CommandNotSupportedException` with a clear "ephpm KV does not
+implement \<CMD\>" message. ePHPm's KV store is intentionally a string +
+counter store; if you need anything beyond that, point Predis at a real
+Redis for those calls. In particular, **Lua-scripted rate limiters,
+pub/sub, and broadcasting do not work through this connection** — they
+need `EVAL`/`SUBSCRIBE`/`PUBLISH`.
 
 ---
 
@@ -364,10 +378,52 @@ beyond that, point Predis at a real Redis for those calls.
 | -------------------- | --------------- |
 | `EX seconds`         | supported       |
 | `PX milliseconds`    | supported (rounded up to seconds) |
-| `NX`, `XX`           | unsupported (`SET NX`/`XX` is not yet wired to the SAPI's `ephpm_kv_setnx()`) |
+| `NX`                 | supported (atomic insert-if-absent via `ephpm_kv_setnx()`) |
+| `XX`                 | unsupported     |
 | `GET`                | unsupported     |
 | `KEEPTTL`            | unsupported     |
 | `EXAT`, `PXAT`       | unsupported     |
+
+### OOM and SETNX
+
+Two boundary behaviors worth knowing:
+
+- **OOM surfaces as a `Predis\Response\ServerException`.** A plain `SET`,
+  `SETEX`, or `PSETEX` always overwrites, so if the SAPI refuses the write
+  the only cause is the store hitting `maxmemory` under `noeviction`. This
+  connection raises the same `ServerException`
+  (`OOM command not allowed when used memory > maxmemory.`, error type
+  `OOM`) you'd get over the real RESP wire, rather than silently returning
+  a false `OK`.
+
+- **On the NX path, OOM is indistinguishable from "key already exists."**
+  `ephpm_kv_setnx` returns a single bool whose false means *either* a live
+  entry already exists *or* the write was refused (OOM). This connection
+  reports the common case: `SETNX` returns `0` and `SET … NX` returns nil.
+  A lock you fail to acquire under memory pressure is therefore reported as
+  "already held" — acceptable for lock recipes, but do not rely on the NX
+  reply to detect OOM.
+
+---
+
+## Predis 3 compatibility
+
+This package requires **`predis/predis` ^2.2** and is **not compatible with
+Predis 3** yet. `KvConnection` implements
+`Predis\Connection\NodeConnectionInterface`, and Predis 3 added three abstract
+methods to that interface that Predis 2 doesn't declare:
+
+```php
+public function getClientId(): ?int;
+public function write(string $buffer): void;
+public function hasDataToRead(): bool;
+```
+
+Loading `KvConnection` under Predis 3 therefore fatals with
+*"contains 3 abstract methods and must therefore be declared abstract"*.
+Widening the constraint to `^2.2 || ^3.0` is intentionally **not** done —
+it would require implementing those three methods (and re-testing the wire
+semantics they imply). Track this in the issue tracker if you need Predis 3.
 
 ---
 
@@ -428,8 +484,9 @@ single connection at it) or switch the queue to the database driver.
 ePHPm runs PHP inside the same OS process as the KV store via the embed
 SAPI. The store itself is a Rust [`DashMap`](https://docs.rs/dashmap/)
 plus TTL management. ePHPm registers a small set of host functions
-(`ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_incr_by`, `ephpm_kv_expire`,
-`ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_del`, `ephpm_kv_exists`) into
+(`ephpm_kv_get`, `ephpm_kv_set`, `ephpm_kv_setnx`, `ephpm_kv_incr_by`,
+`ephpm_kv_expire`, `ephpm_kv_ttl`, `ephpm_kv_pttl`, `ephpm_kv_del`,
+`ephpm_kv_exists`) into
 PHP's global function table. Calling one is a direct C function call
 into Rust — no socket, no protocol parser, no value serialization beyond
 what userland code already does.

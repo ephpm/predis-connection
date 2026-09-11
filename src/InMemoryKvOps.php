@@ -21,6 +21,22 @@ final class InMemoryKvOps implements KvOpsInterface
     /** @var array<string, int> deadline in milliseconds since epoch */
     private array $deadlines = [];
 
+    /**
+     * Test hook: when true, every write (`set`/`setnx`) refuses like a store
+     * that has hit `maxmemory` under `noeviction` — the SAPI returns `false`
+     * without storing. Lets the connection's OOM handling be exercised without
+     * a real out-of-memory condition.
+     */
+    private bool $oom = false;
+
+    /**
+     * Simulate (or clear) an out-of-memory store for the next writes. Test-only.
+     */
+    public function simulateOom(bool $on = true): void
+    {
+        $this->oom = $on;
+    }
+
     public function get(string $key): ?string
     {
         return $this->liveValue($key);
@@ -28,6 +44,9 @@ final class InMemoryKvOps implements KvOpsInterface
 
     public function set(string $key, string $value, int $ttlSeconds = 0): bool
     {
+        if ($this->oom) {
+            return false;
+        }
         $this->values[$key] = $value;
         if ($ttlSeconds > 0) {
             $this->deadlines[$key] = $this->nowMs() + ($ttlSeconds * 1000);
@@ -35,6 +54,19 @@ final class InMemoryKvOps implements KvOpsInterface
             unset($this->deadlines[$key]);
         }
         return true;
+    }
+
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool
+    {
+        // Mirrors the SAPI: false when a live entry already exists OR the store
+        // refuses the write (OOM) — both collapse to the same bool.
+        if ($this->oom) {
+            return false;
+        }
+        if ($this->liveValue($key) !== null) {
+            return false;
+        }
+        return $this->set($key, $value, $ttlSeconds);
     }
 
     public function del(string $key): int

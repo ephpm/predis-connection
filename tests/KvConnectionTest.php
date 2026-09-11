@@ -11,6 +11,7 @@ use PHPUnit\Framework\Attributes\CoversClass;
 use PHPUnit\Framework\TestCase;
 use Predis\Client;
 use Predis\Command\RawCommand;
+use Predis\Response\ServerException;
 
 #[CoversClass(KvConnection::class)]
 #[CoversClass(CommandNotSupportedException::class)]
@@ -61,9 +62,77 @@ final class KvConnectionTest extends TestCase
     public function test_set_with_unsupported_modifier_throws(): void
     {
         $client = $this->client();
+        // XX (and GET/KEEPTTL/EXAT/PXAT) stay unsupported; only NX is wired.
         $this->expectException(CommandNotSupportedException::class);
-        $this->expectExceptionMessageMatches('/SET NX/');
-        $client->set('foo', 'bar', 'NX');
+        $this->expectExceptionMessageMatches('/SET XX/');
+        $client->set('foo', 'bar', 'XX');
+    }
+
+    // ── NX / SETNX (locking primitives) ───────────────────────────────────────
+
+    public function test_setnx_returns_one_when_inserted_zero_when_present(): void
+    {
+        $client = $this->client();
+        self::assertSame(1, $client->setnx('lock', 'a'));
+        self::assertSame(0, $client->setnx('lock', 'b'));
+        // First writer wins; value is not overwritten.
+        self::assertSame('a', $client->get('lock'));
+    }
+
+    public function test_set_nx_returns_ok_when_absent_nil_when_present(): void
+    {
+        $client = $this->client();
+        // SET key value NX → OK on first write, nil when the key already exists.
+        self::assertSame('OK', $client->set('lock', 'a', 'NX'));
+        self::assertNull($client->set('lock', 'b', 'NX'));
+        self::assertSame('a', $client->get('lock'));
+    }
+
+    public function test_set_nx_with_ex_applies_ttl_on_insert(): void
+    {
+        $client = $this->client();
+        self::assertSame('OK', $client->set('lock', 'a', 'EX', 30, 'NX'));
+        $ttl = $client->ttl('lock');
+        self::assertGreaterThan(0, $ttl);
+        self::assertLessThanOrEqual(30, $ttl);
+    }
+
+    // ── OOM handling ──────────────────────────────────────────────────────────
+
+    public function test_plain_set_throws_server_exception_on_oom(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->simulateOom(true);
+        $client = new Client(new KvConnection(null, $ops));
+
+        try {
+            $client->set('k', 'v');
+            self::fail('expected ServerException on OOM');
+        } catch (ServerException $e) {
+            self::assertSame('OOM', $e->getErrorType());
+            self::assertStringContainsString('maxmemory', $e->getMessage());
+        }
+    }
+
+    public function test_setex_throws_server_exception_on_oom(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->simulateOom(true);
+        $client = new Client(new KvConnection(null, $ops));
+
+        $this->expectException(ServerException::class);
+        $client->setex('k', 30, 'v');
+    }
+
+    public function test_psetex_throws_server_exception_on_oom(): void
+    {
+        $ops = new InMemoryKvOps();
+        $ops->simulateOom(true);
+        $client = new Client(new KvConnection(null, $ops));
+
+        $this->expectException(ServerException::class);
+        $psetex = $client->createCommand('PSETEX', ['k', 1000, 'v']);
+        $client->executeCommand($psetex);
     }
 
     public function test_setex_writes_key_with_ttl(): void

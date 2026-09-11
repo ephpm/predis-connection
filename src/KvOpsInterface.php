@@ -34,6 +34,20 @@ interface KvOpsInterface
     public function set(string $key, string $value, int $ttlSeconds = 0): bool;
 
     /**
+     * Atomically set a key to a value only if it does not already exist
+     * (the Redis `SETNX` / `SET … NX` primitive). Backed by the SAPI's
+     * `ephpm_kv_setnx`, which is atomic under a per-shard lock.
+     *
+     * @param int $ttlSeconds 0 means no expiry; positive values are seconds
+     *
+     * @return bool true if the value was inserted; false if a live entry
+     *              already exists OR the store refused the write (OOM). The
+     *              underlying SAPI bool conflates those two outcomes and they
+     *              cannot be distinguished on this path.
+     */
+    public function setnx(string $key, string $value, int $ttlSeconds = 0): bool;
+
+    /**
      * Delete a key.
      *
      * @return int 1 if the key existed, 0 if it did not

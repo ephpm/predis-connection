@@ -8,6 +8,7 @@ use Predis\Command\CommandInterface;
 use Predis\Connection\NodeConnectionInterface;
 use Predis\Connection\Parameters;
 use Predis\Connection\ParametersInterface;
+use Predis\Response\ServerException;
 
 /**
  * Predis Connection that routes Redis-shaped commands directly to the
@@ -42,6 +43,7 @@ final class KvConnection implements NodeConnectionInterface
     public const SUPPORTED_COMMANDS = [
         'GET',
         'SET',
+        'SETNX',
         'SETEX',
         'PSETEX',
         'DEL',
@@ -165,6 +167,7 @@ final class KvConnection implements NodeConnectionInterface
         return match ($id) {
             'GET'             => $this->ops->get((string) $args[0]),
             'SET'             => $this->doSet($args),
+            'SETNX'           => $this->doSetnx($args),
             'SETEX'           => $this->doSetex($args),
             'PSETEX'          => $this->doPsetex($args),
             'DEL', 'UNLINK'   => $this->doDel($args),
@@ -189,10 +192,16 @@ final class KvConnection implements NodeConnectionInterface
     }
 
     /**
-     * SET key value [EX seconds | PX milliseconds] — the modifiers we
-     * can honour map directly to the SAPI's TTL parameter. NX/XX/GET/
-     * KEEPTTL/EXAT/PXAT need atomicity or features the store doesn't
-     * expose, so they raise rather than silently degrading.
+     * SET key value [EX seconds | PX milliseconds] [NX] — the TTL modifiers
+     * map directly to the SAPI's TTL parameter, and NX routes to the atomic
+     * `ephpm_kv_setnx` primitive. XX/GET/KEEPTTL/EXAT/PXAT need features the
+     * store doesn't expose, so they raise rather than silently degrading.
+     *
+     * Return shape matches Redis: `OK` when the value is stored, and — on the
+     * NX path only — `null` (nil) when it isn't. Because `setnx`'s false
+     * conflates "key already exists" with an OOM refusal, the nil we return on
+     * that path is correct for the common (key-exists) case but cannot single
+     * out OOM; this indistinguishability is documented in the README.
      *
      * @param list<mixed> $args
      */
@@ -201,6 +210,7 @@ final class KvConnection implements NodeConnectionInterface
         $key = (string) $args[0];
         $value = (string) $args[1];
         $ttl = 0;
+        $nx = false;
 
         $i = 2;
         $count = \count($args);
@@ -218,6 +228,9 @@ final class KvConnection implements NodeConnectionInterface
                     $i += 2;
                     break;
                 case 'NX':
+                    $nx = true;
+                    $i += 1;
+                    break;
                 case 'XX':
                 case 'GET':
                 case 'KEEPTTL':
@@ -229,31 +242,70 @@ final class KvConnection implements NodeConnectionInterface
             }
         }
 
-        return $this->ops->set($key, $value, $ttl) ? 'OK' : null;
+        if ($nx) {
+            // nil when not set (key already existed — the common case);
+            // OOM is indistinguishable here and also surfaces as nil.
+            return $this->ops->setnx($key, $value, $ttl) ? 'OK' : null;
+        }
+
+        // Plain SET always overwrites, so a false is unambiguously an OOM
+        // refusal — surface it the way the real RESP wire would.
+        if (!$this->ops->set($key, $value, $ttl)) {
+            throw $this->oomException();
+        }
+        return 'OK';
     }
 
     /**
-     * SETEX key seconds value
+     * SETNX key value — insert only if absent. Redis integer reply: 1 when
+     * inserted, 0 when the key already existed. A refused write (OOM) is also
+     * reported as 0, since `setnx`'s false conflates the two outcomes.
+     *
+     * @param list<mixed> $args
+     */
+    private function doSetnx(array $args): int
+    {
+        return $this->ops->setnx((string) $args[0], (string) $args[1], 0) ? 1 : 0;
+    }
+
+    /**
+     * SETEX key seconds value. `set` false is unambiguously OOM (SETEX always
+     * overwrites), so raise the server error rather than reporting a false OK.
      *
      * @param list<mixed> $args
      */
     private function doSetex(array $args): string
     {
-        $this->ops->set((string) $args[0], (string) $args[2], (int) $args[1]);
+        if (!$this->ops->set((string) $args[0], (string) $args[2], (int) $args[1])) {
+            throw $this->oomException();
+        }
         return 'OK';
     }
 
     /**
      * PSETEX key milliseconds value — TTL rounded up to whole seconds
-     * because the SAPI takes seconds.
+     * because the SAPI takes seconds. OOM raises, as for SETEX.
      *
      * @param list<mixed> $args
      */
     private function doPsetex(array $args): string
     {
         $ms = (int) $args[1];
-        $this->ops->set((string) $args[0], (string) $args[2], (int) \ceil($ms / 1000));
+        if (!$this->ops->set((string) $args[0], (string) $args[2], (int) \ceil($ms / 1000))) {
+            throw $this->oomException();
+        }
         return 'OK';
+    }
+
+    /**
+     * The server-side error a real Redis raises when a write is rejected for
+     * `maxmemory` — reproduced verbatim so callers see the identical
+     * {@see ServerException} they would over the RESP wire (its `getErrorType()`
+     * is `OOM`).
+     */
+    private function oomException(): ServerException
+    {
+        return new ServerException('OOM command not allowed when used memory > maxmemory.');
     }
 
     /**
