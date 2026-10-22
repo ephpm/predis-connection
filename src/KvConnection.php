@@ -27,10 +27,12 @@ use Predis\Response\ServerException;
  *
  * Only the subset of Redis that ephpm's KV store implements is wired
  * through (string GET/SET, counters, TTL, EXISTS, DEL, plus a couple
- * connection-management no-ops). Everything else throws
+ * connection-management no-ops; on ePHPm v0.13+ also hashes, MGET/MSET,
+ * GETDEL/GETEX, PERSIST, APPEND/STRLEN, SCAN and SET … IFEQ — see
+ * {@see EXTENDED_COMMANDS}, each feature-detected). Everything else throws
  * {@see CommandNotSupportedException} with a clear "ephpm KV does not
  * implement <CMD>" message — that surface is intentional, so callers
- * who reach for hashes/lists/streams/scripts know to keep that workload
+ * who reach for lists/sets/streams/scripts know to keep that workload
  * on a real Redis.
  */
 final class KvConnection implements NodeConnectionInterface
@@ -65,6 +67,42 @@ final class KvConnection implements NodeConnectionInterface
         'QUIT',
         'FLUSHDB',
         'FLUSHALL',
+    ];
+
+    /**
+     * Commands wired to the `ephpm_kv_*` functions added in ePHPm v0.13.0,
+     * mapped to the backend operations ({@see ExtendedKvOpsInterface::OPS})
+     * each one needs. A command is executed only when the backend supports
+     * every listed operation; otherwise it raises
+     * {@see CommandNotSupportedException} exactly as before v0.13.
+     * (`TYPE` is in {@see SUPPORTED_COMMANDS} and upgrades itself to
+     * `ephpm_kv_type` when available; `SET … IFEQ` needs `set_if_eq`.)
+     */
+    public const EXTENDED_COMMANDS = [
+        'HSET'     => ['hset'],
+        'HMSET'    => ['hset'],
+        'HSETNX'   => ['hsetnx'],
+        'HGET'     => ['hget'],
+        'HMGET'    => ['hmget'],
+        'HGETALL'  => ['hgetall'],
+        'HDEL'     => ['hdel'],
+        'HEXISTS'  => ['hexists'],
+        'HLEN'     => ['hlen'],
+        'HKEYS'    => ['hkeys'],
+        'HVALS'    => ['hvals'],
+        'HINCRBY'  => ['hincr_by'],
+        'HEXPIRE'  => ['hexpire', 'hdel'],
+        'HTTL'     => ['httl'],
+        'HPTTL'    => ['hpttl'],
+        'HPERSIST' => ['hpersist', 'hpttl'],
+        'MGET'     => ['mget'],
+        'MSET'     => ['mset'],
+        'GETDEL'   => ['getdel'],
+        'GETEX'    => ['getex'],
+        'PERSIST'  => ['persist'],
+        'APPEND'   => ['append'],
+        'STRLEN'   => ['strlen'],
+        'SCAN'     => ['scan'],
     ];
 
     private ParametersInterface $parameters;
@@ -187,8 +225,378 @@ final class KvConnection implements NodeConnectionInterface
             // ephpm KV is a single keyspace, so FLUSHDB and FLUSHALL are
             // equivalent — both clear the whole effective store.
             'FLUSHDB', 'FLUSHALL' => $this->ops->flush() ? 'OK' : null,
-            default           => throw new CommandNotSupportedException($id),
+            default           => $this->dispatchExtended($id, $args),
         };
+    }
+
+    /**
+     * Every command this connection executes against the current backend:
+     * {@see SUPPORTED_COMMANDS} plus whichever {@see EXTENDED_COMMANDS} the
+     * backend (i.e. the running ePHPm) supports.
+     *
+     * @return list<string>
+     */
+    public function supportedCommands(): array
+    {
+        $commands = self::SUPPORTED_COMMANDS;
+        foreach (self::EXTENDED_COMMANDS as $id => $ops) {
+            if ($this->supportsAll($ops)) {
+                $commands[] = $id;
+            }
+        }
+        return $commands;
+    }
+
+    /**
+     * @param list<string> $ops
+     */
+    private function supportsAll(array $ops): bool
+    {
+        if (!$this->ops instanceof ExtendedKvOpsInterface) {
+            return false;
+        }
+        foreach ($ops as $op) {
+            if (!$this->ops->supports($op)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private function unsupported(string $what): CommandNotSupportedException
+    {
+        return new CommandNotSupportedException($what, $this->supportedCommands());
+    }
+
+    /**
+     * The v0.13 commands. Anything not wired — or wired but missing from the
+     * running ePHPm — raises {@see CommandNotSupportedException}, the
+     * pre-v0.13 behavior for all of these.
+     *
+     * @param list<mixed> $args
+     */
+    private function dispatchExtended(string $id, array $args): mixed
+    {
+        $ops = $this->ops;
+        if (!isset(self::EXTENDED_COMMANDS[$id])
+            || !$ops instanceof ExtendedKvOpsInterface
+            || !$this->supportsAll(self::EXTENDED_COMMANDS[$id])
+        ) {
+            throw $this->unsupported($id);
+        }
+        $key = (string) ($args[0] ?? '');
+
+        return match ($id) {
+            'HSET'     => $this->doHset($ops, $args, false),
+            'HMSET'    => $this->doHset($ops, $args, true),
+            'HSETNX'   => $ops->hsetnx($key, (string) $args[1], (string) $args[2]) ? 1 : 0,
+            'HGET'     => $ops->hget($key, (string) $args[1]),
+            'HMGET'    => $this->orFail($ops->hmget($key, self::strings(\array_slice($args, 1))), 'ephpm_kv_hmget'),
+            'HGETALL'  => $this->doHgetall($ops, $key),
+            'HDEL'     => $ops->hdel($key, self::strings(\array_slice($args, 1))),
+            'HEXISTS'  => $ops->hexists($key, (string) $args[1]) ? 1 : 0,
+            'HLEN'     => $ops->hlen($key),
+            'HKEYS'    => self::strings($this->orFail($ops->hkeys($key), 'ephpm_kv_hkeys')),
+            'HVALS'    => self::strings($this->orFail($ops->hvals($key), 'ephpm_kv_hvals')),
+            'HINCRBY'  => $this->doHincrby($ops, $args),
+            'HEXPIRE'  => $this->doHexpire($ops, $args),
+            'HTTL'     => \array_map(static fn (string $f): int => $ops->httl($key, $f), self::fieldsArg($args, 1, $id)),
+            'HPTTL'    => \array_map(static fn (string $f): int => $ops->hpttl($key, $f), self::fieldsArg($args, 1, $id)),
+            'HPERSIST' => $this->doHpersist($ops, $args),
+            'MGET'     => $this->orFail($ops->mget(self::strings($args)), 'ephpm_kv_mget'),
+            'MSET'     => $this->doMset($ops, $args),
+            'GETDEL'   => $ops->getdel($key),
+            'GETEX'    => $this->doGetex($ops, $args),
+            'PERSIST'  => $ops->persist($key) ? 1 : 0,
+            'APPEND'   => $this->orFail($ops->append($key, (string) $args[1]), 'ephpm_kv_append'),
+            'STRLEN'   => $ops->strlen($key),
+            'SCAN'     => $this->doScan($ops, $args),
+        };
+    }
+
+    /**
+     * HSET key field value [field value …] → integer (fields created).
+     * HMSET (deprecated alias) → OK. Both write through the array form of
+     * `ephpm_kv_hset`; a refused write (memory limit, clustered field value
+     * over the size limit) raises a {@see ServerException}.
+     *
+     * @param list<mixed> $args
+     */
+    private function doHset(ExtendedKvOpsInterface $ops, array $args, bool $hmset): int|string
+    {
+        $pairs = \array_slice($args, 1);
+        if ($pairs === [] || \count($pairs) % 2 !== 0) {
+            $cmd = $hmset ? 'hmset' : 'hset';
+            throw new ServerException("ERR wrong number of arguments for '{$cmd}' command");
+        }
+        $fields = [];
+        for ($i = 0, $n = \count($pairs); $i < $n; $i += 2) {
+            $fields[(string) $pairs[$i]] = (string) $pairs[$i + 1];
+        }
+        $created = $this->orFail($ops->hset((string) $args[0], $fields), 'ephpm_kv_hset');
+        return $hmset ? 'OK' : $created;
+    }
+
+    /**
+     * HGETALL — Predis' `HGETALL::parseResponse()` expects the raw RESP
+     * shape, a flat `[field, value, field, value, …]` list, and folds it into
+     * an associative array itself.
+     *
+     * @return list<string>
+     */
+    private function doHgetall(ExtendedKvOpsInterface $ops, string $key): array
+    {
+        $flat = [];
+        foreach ($this->orFail($ops->hgetall($key), 'ephpm_kv_hgetall') as $field => $value) {
+            $flat[] = (string) $field;
+            $flat[] = (string) $value;
+        }
+        return $flat;
+    }
+
+    /**
+     * @param list<mixed> $args
+     */
+    private function doHincrby(ExtendedKvOpsInterface $ops, array $args): int
+    {
+        $result = $ops->hincrBy((string) $args[0], (string) $args[1], (int) $args[2]);
+        if ($result === false) {
+            throw new ServerException('ERR hash value is not an integer or out of range');
+        }
+        return $result;
+    }
+
+    /**
+     * HEXPIRE key seconds FIELDS numfields field … → one integer per field:
+     * 1 TTL set, -2 no such field, 2 field deleted (seconds = 0, i.e. the
+     * expiry is already due — `ephpm_kv_hexpire` refuses a TTL <= 0, so this
+     * deletes via `ephpm_kv_hdel` the way Redis does). Each field is handled
+     * on its own, so the reply is per field as Redis gives it.
+     *
+     * The NX/XX/GT/LT conditions would need a read-then-write the store
+     * cannot do atomically, so they stay unsupported rather than being
+     * ignored. (HPEXPIRE/HEXPIREAT/HPEXPIREAT are not wired at all.)
+     *
+     * @param list<mixed> $args
+     *
+     * @return list<int>
+     */
+    private function doHexpire(ExtendedKvOpsInterface $ops, array $args): array
+    {
+        $key = (string) $args[0];
+        $seconds = self::intArg($args[1] ?? null);
+        $at = 2;
+        if (isset($args[$at]) && \strtoupper((string) $args[$at]) !== 'FIELDS') {
+            $flag = \strtoupper((string) $args[$at]);
+            if (\in_array($flag, ['NX', 'XX', 'GT', 'LT'], true)) {
+                throw $this->unsupported("HEXPIRE {$flag}");
+            }
+            throw new ServerException('ERR syntax error');
+        }
+        $fields = self::fieldsArg($args, $at, 'HEXPIRE');
+        if ($seconds < 0) {
+            throw new ServerException("ERR invalid expire time in 'hexpire' command");
+        }
+
+        $reply = [];
+        foreach ($fields as $field) {
+            if ($seconds === 0) {
+                $reply[] = $ops->hdel($key, [$field]) === 1 ? 2 : -2;
+                continue;
+            }
+            $set = $ops->hexpire($key, $field, $seconds);
+            if ($set === false) {
+                throw new ServerException("ERR invalid expire time in 'hexpire' command");
+            }
+            $reply[] = $set === 1 ? 1 : -2;
+        }
+        return $reply;
+    }
+
+    /**
+     * HPERSIST key FIELDS numfields field … → per field: 1 TTL removed,
+     * -1 field has no TTL, -2 no such field.
+     *
+     * @param list<mixed> $args
+     *
+     * @return list<int>
+     */
+    private function doHpersist(ExtendedKvOpsInterface $ops, array $args): array
+    {
+        $key = (string) $args[0];
+        $reply = [];
+        foreach (self::fieldsArg($args, 1, 'HPERSIST') as $field) {
+            if ($ops->hpersist($key, $field)) {
+                $reply[] = 1;
+                continue;
+            }
+            // false = no field or no TTL; tell the two apart.
+            $reply[] = $ops->hpttl($key, $field) === -2 ? -2 : -1;
+        }
+        return $reply;
+    }
+
+    /**
+     * MSET key value [key value …] → OK, via `ephpm_kv_mset` (no TTL).
+     *
+     * @param list<mixed> $args
+     */
+    private function doMset(ExtendedKvOpsInterface $ops, array $args): string
+    {
+        if ($args === [] || \count($args) % 2 !== 0) {
+            throw new ServerException("ERR wrong number of arguments for 'mset' command");
+        }
+        $values = [];
+        for ($i = 0, $n = \count($args); $i < $n; $i += 2) {
+            $values[(string) $args[$i]] = (string) $args[$i + 1];
+        }
+        if (!$ops->mset($values, 0)) {
+            throw new ServerException(
+                'ERR ephpm_kv_mset refused the write (memory limit or invalid key); '
+                . 'keys before the refused one may already be stored'
+            );
+        }
+        return 'OK';
+    }
+
+    /**
+     * GETEX key [EX seconds | PX milliseconds | PERSIST]. PX is accepted only
+     * when it is a whole number of seconds (the SAPI takes seconds and
+     * rounding would change the expiry); EXAT/PXAT and sub-second PX stay
+     * unsupported.
+     *
+     * @param list<mixed> $args
+     */
+    private function doGetex(ExtendedKvOpsInterface $ops, array $args): ?string
+    {
+        $key = (string) $args[0];
+        if (\count($args) === 1) {
+            return $this->ops->get($key);
+        }
+        $modifier = \strtoupper((string) $args[1]);
+        if ($modifier === 'PERSIST' && \count($args) === 2) {
+            return $ops->getex($key, 0);
+        }
+        if (($modifier === 'EX' || $modifier === 'PX') && \count($args) === 3) {
+            $amount = self::intArg($args[2]);
+            if ($amount <= 0) {
+                throw new ServerException("ERR invalid expire time in 'getex' command");
+            }
+            if ($modifier === 'PX') {
+                if ($amount % 1000 !== 0) {
+                    throw $this->unsupported('GETEX PX (sub-second)');
+                }
+                $amount = \intdiv($amount, 1000);
+            }
+            return $ops->getex($key, $amount);
+        }
+        if ($modifier === 'EXAT' || $modifier === 'PXAT') {
+            throw $this->unsupported("GETEX {$modifier}");
+        }
+        throw new ServerException('ERR syntax error');
+    }
+
+    /**
+     * SCAN cursor [MATCH pattern] [COUNT count] → `[cursor-as-string, keys]`,
+     * the RESP shape Predis (and its `Keyspace` iterator) expects. In a
+     * cluster this lists this node's keyspace only — see the README. The
+     * TYPE filter is not supported.
+     *
+     * @param list<mixed> $args
+     *
+     * @return array{0: string, 1: list<string>}
+     */
+    private function doScan(ExtendedKvOpsInterface $ops, array $args): array
+    {
+        $cursor = (string) ($args[0] ?? '');
+        if (\preg_match('/^\d+$/', $cursor) !== 1) {
+            throw new ServerException('ERR invalid cursor');
+        }
+        $match = null;
+        $count = 10;
+        for ($i = 1, $n = \count($args); $i < $n; $i += 2) {
+            $option = \strtoupper((string) $args[$i]);
+            if (!\array_key_exists($i + 1, $args)) {
+                throw new ServerException('ERR syntax error');
+            }
+            switch ($option) {
+                case 'MATCH':
+                    $match = (string) $args[$i + 1];
+                    break;
+                case 'COUNT':
+                    $count = self::intArg($args[$i + 1]);
+                    if ($count < 1) {
+                        throw new ServerException('ERR syntax error');
+                    }
+                    break;
+                case 'TYPE':
+                    throw $this->unsupported('SCAN TYPE');
+                default:
+                    throw new ServerException('ERR syntax error');
+            }
+        }
+        [$next, $keys] = $this->orFail($ops->scan((int) $cursor, $match, $count), 'ephpm_kv_scan');
+        return [(string) $next, self::strings($keys)];
+    }
+
+    /**
+     * Parse a `FIELDS numfields field …` block starting at `$at`.
+     *
+     * @param list<mixed> $args
+     *
+     * @return list<string>
+     */
+    private static function fieldsArg(array $args, int $at, string $cmd): array
+    {
+        if (\strtoupper((string) ($args[$at] ?? '')) !== 'FIELDS') {
+            throw new ServerException("ERR Mandatory argument FIELDS is missing or not at the right position for '" . \strtolower($cmd) . "'");
+        }
+        $num = self::intArg($args[$at + 1] ?? null);
+        $fields = self::strings(\array_slice($args, $at + 2));
+        if ($num < 1 || $num !== \count($fields)) {
+            throw new ServerException('ERR The `numfields` parameter must match the number of arguments');
+        }
+        return $fields;
+    }
+
+    private static function intArg(mixed $value): int
+    {
+        if (\is_int($value)) {
+            return $value;
+        }
+        if (\is_string($value) && \preg_match('/^-?\d+$/', $value) === 1) {
+            return (int) $value;
+        }
+        throw new ServerException('ERR value is not an integer or out of range');
+    }
+
+    /**
+     * @param array<mixed> $values
+     *
+     * @return list<string>
+     */
+    private static function strings(array $values): array
+    {
+        return \array_map(static fn (mixed $v): string => (string) $v, \array_values($values));
+    }
+
+    /**
+     * Turn a SAPI failure value (`false`) into a {@see ServerException}.
+     *
+     * @template T
+     *
+     * @param T|false $result
+     *
+     * @return T
+     */
+    private function orFail(mixed $result, string $function): mixed
+    {
+        if ($result === false) {
+            throw new ServerException(
+                "ERR {$function} failed (memory limit, oversized clustered hash field, invalid key, or no KV store)"
+            );
+        }
+        return $result;
     }
 
     /**
@@ -207,10 +615,16 @@ final class KvConnection implements NodeConnectionInterface
      */
     private function doSet(array $args): ?string
     {
+        // Predis' SET::setArguments() drops null/false modifiers without
+        // re-indexing; walk a dense list.
+        $args = \array_values($args);
         $key = (string) $args[0];
         $value = (string) $args[1];
         $ttl = 0;
+        $ttlGiven = false;
         $nx = false;
+        $keepTtl = false;
+        $ifeq = null;
 
         $i = 2;
         $count = \count($args);
@@ -219,27 +633,47 @@ final class KvConnection implements NodeConnectionInterface
             switch ($modifier) {
                 case 'EX':
                     $ttl = (int) $args[$i + 1];
+                    $ttlGiven = true;
                     $i += 2;
                     break;
                 case 'PX':
                     // Round up so PX 1500 → 2 s rather than truncating to 1.
                     $ms = (int) $args[$i + 1];
                     $ttl = (int) \ceil($ms / 1000);
+                    $ttlGiven = true;
                     $i += 2;
                     break;
                 case 'NX':
                     $nx = true;
                     $i += 1;
                     break;
+                case 'KEEPTTL':
+                    // Only expressible together with IFEQ (checked below).
+                    $keepTtl = true;
+                    $i += 1;
+                    break;
+                case 'IFEQ':
+                    if (!\array_key_exists($i + 1, $args)) {
+                        throw new ServerException('ERR syntax error');
+                    }
+                    $ifeq = (string) $args[$i + 1];
+                    $i += 2;
+                    break;
                 case 'XX':
                 case 'GET':
-                case 'KEEPTTL':
                 case 'EXAT':
                 case 'PXAT':
-                    throw new CommandNotSupportedException("SET {$modifier}");
+                    throw $this->unsupported("SET {$modifier}");
                 default:
                     throw new \InvalidArgumentException("unknown SET modifier: {$modifier}");
             }
+        }
+
+        if ($ifeq !== null) {
+            return $this->doSetIfEq($key, $value, $ifeq, $ttl, $ttlGiven, $keepTtl, $nx);
+        }
+        if ($keepTtl) {
+            throw $this->unsupported('SET KEEPTTL');
         }
 
         if ($nx) {
@@ -254,6 +688,36 @@ final class KvConnection implements NodeConnectionInterface
             throw $this->oomException();
         }
         return 'OK';
+    }
+
+    /**
+     * SET key value IFEQ expected [EX s | PX ms | KEEPTTL] — Valkey's
+     * compare-and-set, via `ephpm_kv_set_if_eq` (ePHPm v0.13+). `OK` when
+     * the value matched and was replaced, nil otherwise (no such key, a
+     * different value, or — in a cluster — an unreachable key owner). As in
+     * Valkey, the key is never created and, without EX/PX/KEEPTTL, the TTL is
+     * cleared. PX rounds up to whole seconds exactly as for plain SET.
+     */
+    private function doSetIfEq(
+        string $key,
+        string $value,
+        string $expected,
+        int $ttl,
+        bool $ttlGiven,
+        bool $keepTtl,
+        bool $nx,
+    ): ?string {
+        if (!$this->ops instanceof ExtendedKvOpsInterface || !$this->ops->supports('set_if_eq')) {
+            throw $this->unsupported('SET IFEQ');
+        }
+        if ($nx || ($keepTtl && $ttlGiven)) {
+            throw new ServerException('ERR syntax error');
+        }
+        if ($ttlGiven && $ttl <= 0) {
+            throw new ServerException("ERR invalid expire time in 'set' command");
+        }
+        $ttlArg = $keepTtl ? -1 : $ttl;
+        return $this->ops->setIfEq($key, $expected, $value, $ttlArg) ? 'OK' : null;
     }
 
     /**
@@ -353,13 +817,17 @@ final class KvConnection implements NodeConnectionInterface
     }
 
     /**
-     * TYPE only ever returns "string" or "none" since the store has no
-     * other shapes to report — that's the whole point of the connection.
+     * TYPE — `ephpm_kv_type` ("string" | "hash" | "none") on ePHPm v0.13+.
+     * Older runtimes have no hashes, so there it is "string" if the key
+     * exists and "none" otherwise.
      *
      * @param list<mixed> $args
      */
     private function doType(array $args): string
     {
+        if ($this->ops instanceof ExtendedKvOpsInterface && $this->ops->supports('type')) {
+            return $this->ops->type((string) $args[0]);
+        }
         return $this->ops->exists((string) $args[0]) ? 'string' : 'none';
     }
 }
