@@ -68,4 +68,31 @@ final class SapiKvOpsTest extends TestCase
         SapiStubKv::$oom = true;
         self::assertFalse((new SapiKvOps())->set('k', 'v'));
     }
+
+    public function test_supports_tracks_which_functions_exist(): void
+    {
+        $ops = new SapiKvOps();
+        self::assertTrue($ops->supports('hset'));
+        self::assertTrue($ops->supports('mget'));
+        // Not stubbed — i.e. "this ePHPm does not have it".
+        self::assertFalse($ops->supports('hpersist'));
+        // Existing functions are not v0.13 operations.
+        self::assertFalse($ops->supports('get'));
+        self::assertFalse($ops->supports('bogus'));
+    }
+
+    public function test_hash_and_multi_key_calls_pass_through(): void
+    {
+        $ops = new SapiKvOps();
+        self::assertSame(2, $ops->hset('h', ['a' => '1', 'b' => '2']));
+        self::assertSame('1', $ops->hget('h', 'a'));
+        self::assertSame(['a' => '1', 'b' => '2'], $ops->hgetall('h'));
+        self::assertTrue($ops->mset(['x' => '1', 'y' => '2']));
+        self::assertSame(['1', null, '2'], $ops->mget(['x', 'zz', 'y']));
+    }
+
+    public function test_scan_relists_the_key_page(): void
+    {
+        self::assertSame([0, ['a', 'b']], (new SapiKvOps())->scan(0, 'x*', 10));
+    }
 }

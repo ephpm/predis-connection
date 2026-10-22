@@ -54,7 +54,10 @@ written in Rust.
   commands (the `ephpm_kv_*` SAPI functions have shipped since ePHPm
   v0.1.0; `FLUSHDB`/`FLUSHALL` need `ephpm_kv_flush_all()`, added in
   v0.1.2; `SETNX` / `SET … NX` need `ephpm_kv_setnx()`; current release:
-  v0.10.2). The functions are
+  v0.10.2). The hash, multi-key and other commands listed under
+  [ePHPm v0.13+ commands](#ephpm-v013-commands) need ePHPm **v0.13.0+**;
+  each is feature-detected, so on an older runtime those commands keep
+  raising `CommandNotSupportedException` exactly as before. The functions are
   registered by ePHPm's embedded PHP. If you're running your code under
   PHP-FPM, Apache mod_php, or the stock PHP CLI, those functions don't
   exist and `SapiKvOps::__construct()` throws on instantiation. For
@@ -236,7 +239,8 @@ keep them on a real Redis (or a different transport):
   that ships a Lua script — they run via `EVAL`, which this connection does
   not implement. (Laravel's *cache-based* limiter — `RateLimiter` / the
   `throttle` middleware — is fine: it only uses counter ops.)
-- Any explicit list / hash / set / sorted-set / stream ops you've written.
+- Any explicit list / set / sorted-set / stream ops you've written (and hash
+  ops on ePHPm older than v0.13.0).
 
 ### Sanity check from artisan
 
@@ -356,19 +360,48 @@ If this round-trips successfully you've confirmed:
 | `DEL`, `UNLINK`, `EXISTS`                        | Multi-key, return count.                                                |
 | `INCR`, `DECR`, `INCRBY`, `DECRBY`               | Atomic counter ops via the SAPI's `ephpm_kv_incr_by`.                   |
 | `EXPIRE`, `PEXPIRE`, `TTL`, `PTTL`               | TTL management. `PEXPIRE` rounds up.                                    |
-| `TYPE`                                           | Returns `string` if the key exists, `none` if not.                      |
+| `TYPE`                                           | `string`, `hash` or `none` via `ephpm_kv_type` on ePHPm v0.13+; on older runtimes `string` if the key exists, `none` if not. |
 | `PING`, `ECHO`                                   | Connection liveness, payload echo.                                      |
 | `SELECT`, `AUTH`, `QUIT`                         | Tolerated as no-ops so framework handshakes don't break.                |
 | `FLUSHDB`, `FLUSHALL`                            | Clear the entire effective store. ephpm's KV is a single keyspace, so both are equivalent. Needs ePHPm v0.1.2+ (`ephpm_kv_flush_all`); on v0.1.0/v0.1.1 this is a no-op returning `null`. |
 
-Everything else — lists, sets, hashes, sorted sets, streams, scripting
-(`EVAL`), pub/sub (`SUBSCRIBE`/`PUBLISH`), `MULTI`/`EXEC` — raises
+Everything else — lists, sets, sorted sets, streams, scripting
+(`EVAL`), pub/sub (`SUBSCRIBE`/`PUBLISH`), `MULTI`/`EXEC`, and the commands
+below on an ePHPm older than v0.13.0 — raises
 `Ephpm\Predis\CommandNotSupportedException` with a clear "ephpm KV does not
-implement \<CMD\>" message. ePHPm's KV store is intentionally a string +
-counter store; if you need anything beyond that, point Predis at a real
+implement \<CMD\>" message (listing the commands that *are* available on the
+running ePHPm). ePHPm's KV store is intentionally a string + counter + hash
+store; if you need anything beyond that, point Predis at a real
 Redis for those calls. In particular, **Lua-scripted rate limiters,
 pub/sub, and broadcasting do not work through this connection** — they
 need `EVAL`/`SUBSCRIBE`/`PUBLISH`.
+
+### ePHPm v0.13+ commands
+
+These map onto the `ephpm_kv_*` functions added in ePHPm v0.13.0. Each one is
+feature-detected with `function_exists()` (`KvConnection::EXTENDED_COMMANDS`
+lists the functions each command needs); when the running ePHPm lacks them the
+command raises `CommandNotSupportedException`, as it always did.
+
+| Command(s)                                       | Behavior                                                                |
+| ------------------------------------------------ | ----------------------------------------------------------------------- |
+| `HSET`, `HMSET`                                  | Any number of field/value pairs in one write. `HSET` returns the number of fields created, `HMSET` `OK`. A refused write raises `ServerException`. |
+| `HGET`, `HMGET`, `HGETALL`                       | nil for a missing field/hash. `HGETALL` returns an associative array (Predis folds the flat reply). |
+| `HDEL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`      | As in Redis.                                                            |
+| `HSETNX`, `HINCRBY`                              | `1`/`0`; new value (non-integer field raises `ServerException`). `HINCRBY` keeps the field's TTL. |
+| `HEXPIRE key seconds FIELDS n f …`               | Per-field reply: `1` set, `-2` no such field, `2` deleted (`seconds` = 0). The `NX`/`XX`/`GT`/`LT` conditions are **not supported** (they would need a non-atomic read-then-write) and raise `CommandNotSupportedException`; so do `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT`. |
+| `HTTL`, `HPTTL`, `HPERSIST`                      | Per-field replies as in Redis (`-2` no field, `-1` no TTL).            |
+| `MGET`, `MSET`                                   | Multi-key read / write (no TTL). `MSET` refused under the memory limit raises `ServerException`; keys before the refused one may already be stored. |
+| `GETDEL`                                         | Read and delete.                                                        |
+| `GETEX`                                          | No option (plain read), `EX`, `PERSIST`, and `PX` when it is a whole number of seconds. Sub-second `PX`, `EXAT` and `PXAT` raise `CommandNotSupportedException`. |
+| `PERSIST`, `APPEND`, `STRLEN`                    | As in Redis.                                                            |
+| `SCAN cursor [MATCH p] [COUNT n]`                | Reply `[cursor-as-string, keys]`; works with Predis' `Keyspace` iterator. `TYPE` filter unsupported. **In a cluster SCAN lists only this node's keyspace**: every hash and every string up to `[cluster.kv] small_key_threshold` is on every node, but larger string values only on their replica nodes. |
+| `SET … IFEQ expected`                            | Compare-and-set (`ephpm_kv_set_if_eq`): `OK` if the current value equals `expected`, nil otherwise; never creates the key. `EX`/`PX` set a TTL, `KEEPTTL` keeps it, neither clears it. Not combinable with `NX`. |
+
+Hash notes: hash field values in a **cluster** are limited to
+`[cluster.kv] small_key_threshold - 17` bytes (495 by default); a larger
+value makes `HSET` raise `ServerException`. Whole-key `EXPIRE`/`TTL`/`DEL` work
+on hash keys too.
 
 ---
 
@@ -379,9 +412,10 @@ need `EVAL`/`SUBSCRIBE`/`PUBLISH`.
 | `EX seconds`         | supported       |
 | `PX milliseconds`    | supported (rounded up to seconds) |
 | `NX`                 | supported (atomic insert-if-absent via `ephpm_kv_setnx()`) |
+| `IFEQ expected`      | supported on ePHPm v0.13+ (compare-and-set via `ephpm_kv_set_if_eq()`) |
 | `XX`                 | unsupported     |
 | `GET`                | unsupported     |
-| `KEEPTTL`            | unsupported     |
+| `KEEPTTL`            | only together with `IFEQ` |
 | `EXAT`, `PXAT`       | unsupported     |
 
 ### OOM and SETNX
@@ -445,7 +479,9 @@ assert($client->get('foo') === 'bar');
 
 `InMemoryKvOps` is for tests only — values live in PHP arrays, there is
 no eviction policy, no memory limit, and TTL is best-effort lazy
-expiry. Don't use it in production.
+expiry. Don't use it in production. It implements the v0.13 commands too;
+pass a list of operation names to emulate an older ePHPm — `new
+InMemoryKvOps([])` behaves like a runtime without any of them.
 
 ---
 
@@ -460,7 +496,8 @@ the second arg of `KvConnection` (tests).
 ### `CommandNotSupportedException: ephpm KV does not implement 'LPUSH'`
 
 You called a Redis command outside the supported subset (lists/sets/
-hashes/streams/scripts/pub-sub). Either change the call to use the
+streams/scripts/pub-sub, or hashes and the other
+[v0.13 commands](#ephpm-v013-commands) on an older ePHPm). Either change the call to use the
 string + counter ops your data model can be expressed with, or keep
 that workload on a real Redis (you can wire two clients in your app and
 route per-key-pattern).
