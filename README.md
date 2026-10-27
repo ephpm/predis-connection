@@ -79,12 +79,12 @@ will refuse to construct.
 
 ePHPm packages are distributed via their GitHub repositories, not
 Packagist. Add this repo as a Composer `vcs` repository, then require
-the package (`ephpm/predis-connection` is tagged `v0.1.0`, so `^0.1`
+the package (`ephpm/predis-connection` is tagged `v0.2.0`, so `^0.2`
 resolves):
 
 ```bash
 composer config repositories.ephpm/predis-connection vcs https://github.com/ephpm/predis-connection
-composer require ephpm/predis-connection:^0.1
+composer require ephpm/predis-connection:^0.2
 ```
 
 That's it. Composer pulls in `predis/predis` if you don't already have it.
@@ -95,7 +95,7 @@ If you're starting a brand-new project from scratch:
 mkdir my-app && cd my-app
 composer init --no-interaction --name=acme/my-app --require=php:^8.2
 composer config repositories.ephpm/predis-connection vcs https://github.com/ephpm/predis-connection
-composer require ephpm/predis-connection:^0.1
+composer require ephpm/predis-connection:^0.2
 ```
 
 ---
@@ -125,7 +125,7 @@ my-app/
     ],
     "require": {
         "php": "^8.2",
-        "ephpm/predis-connection": "^0.1"
+        "ephpm/predis-connection": "^0.2"
     }
 }
 ```
