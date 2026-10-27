@@ -53,8 +53,7 @@ written in Rust.
 - **The ePHPm runtime** — any tagged release works for the core
   commands (the `ephpm_kv_*` SAPI functions have shipped since ePHPm
   v0.1.0; `FLUSHDB`/`FLUSHALL` need `ephpm_kv_flush_all()`, added in
-  v0.1.2; `SETNX` / `SET … NX` need `ephpm_kv_setnx()`; current release:
-  v0.10.2). The hash, multi-key and other commands listed under
+  v0.1.2; `SETNX` / `SET … NX` need `ephpm_kv_setnx()`; see the [ePHPm releases](https://github.com/ephpm/ephpm/releases) for the latest version). The hash, multi-key and other commands listed under
   [ePHPm v0.13+ commands](#ephpm-v013-commands) need ePHPm **v0.13.0+**;
   each is feature-detected, so on an older runtime those commands keep
   raising `CommandNotSupportedException` exactly as before. The functions are
